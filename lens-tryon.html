@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Lens Try-On Demo</title>
+<style>
+  html, body { margin:0; padding:0; background:#0b0b0d; color:#eee; font-family:-apple-system,Segoe UI,Roboto,sans-serif; height:100%; overflow:hidden; }
+  #stage { position:relative; width:100vw; height:100vh; }
+  video, canvas { position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }
+  video { visibility:hidden; }
+  #ui { position:absolute; left:0; right:0; bottom:0; z-index:5; display:flex; flex-direction:column; align-items:center; gap:10px; padding:16px 16px calc(16px + env(safe-area-inset-bottom)); background:linear-gradient(transparent, rgba(0,0,0,.65)); }
+  button { font-size:16px; padding:12px 22px; border-radius:999px; border:none; background:#fff; color:#111; font-weight:600; }
+  #status { font-size:13px; opacity:.85; text-align:center; padding:0 20px; }
+  #topbar { position:absolute; top:0; left:0; right:0; padding:14px 16px; z-index:5; font-size:14px; opacity:.9; background:linear-gradient(rgba(0,0,0,.55), transparent); }
+
+  #lensCarousel {
+    display:flex; gap:16px; overflow-x:auto; scroll-snap-type:x mandatory;
+    width:100%; padding:4px 28px 2px; -webkit-overflow-scrolling:touch;
+    scrollbar-width:none;
+  }
+  #lensCarousel::-webkit-scrollbar { display:none; }
+  .lensItem {
+    flex:0 0 auto; scroll-snap-align:center; display:flex; flex-direction:column;
+    align-items:center; gap:6px; opacity:.55; transition:opacity .2s ease, transform .2s ease;
+    cursor:pointer; -webkit-tap-highlight-color:transparent;
+  }
+  .lensItem.active { opacity:1; transform:scale(1.08); }
+  .lensThumb {
+    width:56px; height:56px; border-radius:50%; object-fit:cover;
+    border:2px solid rgba(255,255,255,.28); background:#1c1c1f;
+  }
+  .lensItem.active .lensThumb { border-color:#fff; }
+  .lensLabel { font-size:11px; color:#eee; white-space:nowrap; text-align:center; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="topbar">Lens try-on demo — SOL / Sky Medical</div>
+  <div id="ui">
+    <div id="lensCarousel" role="listbox" aria-label="Lens color"></div>
+    <div id="status">Tap Start, allow camera access, and face the camera.</div>
+    <button id="startBtn">Start camera</button>
+  </div>
+</div>
+
+<script>
+  // Surface any error visibly on the page — a silent module/script failure is
+  // exactly what makes "Start" look like it does nothing on a phone with no
+  // visible console.
+  window.addEventListener("error", (e) => {
+    const el = document.getElementById("status");
+    if (el) el.textContent = "Error: " + (e.message || e.error || "unknown script error");
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const el = document.getElementById("status");
+    if (el) el.textContent = "Error: " + (e.reason && e.reason.message ? e.reason.message : e.reason);
+  });
+</script>
+<script type="module">
+import { FilesetResolver, FaceLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+
+// Standard MediaPipe FaceMesh eye-contour index sets (open-eye outline, used to
+// clip the lens so it only ever draws inside the user's real eye opening).
+const RIGHT_EYE = [33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7];
+const LEFT_EYE  = [362,398,384,385,386,387,388,466,263,249,390,373,374,380,381,382];
+// Iris landmark sets (center + 4 boundary points) from the attention-mesh model.
+const RIGHT_IRIS = { center: 468, ring: [469,470,471,472] };
+const LEFT_IRIS  = { center: 473, ring: [474,475,476,477] };
+
+let faceLandmarker = null;
+let running = false;
+
+// How much the drawn lens should overlap the natural iris edge — a real
+// colored contact sits almost exactly on the iris with only a hair of
+// overlap onto the sclera. 1.0 = lens outer edge exactly matches the
+// measured iris diameter; slightly above 1.0 avoids a visible ring of the
+// user's real iris peeking out from tracking jitter.
+const LENS_TO_IRIS_OVERLAP = 1.04;
+
+// The lens PNG's own circular artwork is NOT the full width of its image
+// file — most lens graphics ship with transparent padding around the
+// circle (anti-aliasing margin, export padding, etc). If we scale the raw
+// image to the iris size, that inner padding makes the visible ring render
+// smaller than the real iris — exactly the "lens doesn't match eye size"
+// symptom. So instead of guessing a fixed multiplier, measure the actual
+// opaque-pixel diameter inside the loaded PNG once, and size against THAT,
+// not the file's pixel dimensions. This keeps sizing correct automatically
+// even if the lens artwork is swapped for a different design later.
+function measureLensArtworkFraction(img) {
+  const probe = document.createElement("canvas");
+  probe.width = img.naturalWidth;
+  probe.height = img.naturalHeight;
+  const pctx = probe.getContext("2d", { willReadFrequently: true });
+  pctx.drawImage(img, 0, 0);
+  const { data, width, height } = pctx.getImageData(0, 0, probe.width, probe.height);
+  const cx = width / 2, cy = height / 2;
+  let maxDist = 0;
+  const ALPHA_THRESHOLD = 10;
+  // Scan every few pixels (full-res scan is unnecessary for a bounding radius)
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 200));
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const a = data[(y * width + x) * 4 + 3];
+      if (a > ALPHA_THRESHOLD) {
+        const d = Math.hypot(x - cx, y - cy);
+        if (d > maxDist) maxDist = d;
+      }
+    }
+  }
+  const diameter = maxDist * 2;
+  const fraction = diameter / Math.min(width, height);
+  return fraction > 0 && fraction <= 1 ? fraction : 1;
+}
+
+// --- Lens color carousel -------------------------------------------------
+// Each color is its own PNG (transparent outside the printed iris ring and
+// inside the pupil hole, per measureLensArtworkFraction above). All four are
+// preloaded up front; the carousel below just swaps which one drawLensOnEye
+// reads, it never generates or alters image content.
+const LENS_COLORS = [
+  { id: "contour-gray",  label: "Contour Gray",  src: "assets/lenses/contour-gray.png" },
+  { id: "contour-green", label: "Contour Green", src: "assets/lenses/contour-green.png" },
+  { id: "contour-brown", label: "Contour Brown", src: "assets/lenses/contour-brown.png" },
+  { id: "contour-hazel", label: "Contour Hazel", src: "assets/lenses/contour-hazel.png" },
+];
+
+let currentLensIndex = 0;
+const lensState = LENS_COLORS.map((c) => ({
+  ...c,
+  img: new Image(),
+  artworkFraction: 1,
+  loaded: false,
+}));
+
+lensState.forEach((entry) => {
+  entry.img.addEventListener("load", () => {
+    try {
+      entry.artworkFraction = measureLensArtworkFraction(entry.img);
+    } catch (e) {
+      entry.artworkFraction = 1; // fall back to treating the whole image as the artwork
+    }
+    entry.loaded = true;
+  });
+  entry.img.src = entry.src;
+});
+
+const carouselEl = document.getElementById("lensCarousel");
+
+function buildLensCarousel() {
+  lensState.forEach((entry, i) => {
+    const item = document.createElement("div");
+    item.className = "lensItem" + (i === currentLensIndex ? " active" : "");
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", i === currentLensIndex ? "true" : "false");
+
+    const thumb = document.createElement("img");
+    thumb.className = "lensThumb";
+    thumb.src = entry.src;
+    thumb.alt = entry.label;
+
+    // Color name shown only here, in the picker strip — never drawn onto
+    // the live camera/eye overlay itself.
+    const label = document.createElement("div");
+    label.className = "lensLabel";
+    label.textContent = entry.label;
+
+    item.appendChild(thumb);
+    item.appendChild(label);
+    item.addEventListener("click", () => selectLens(i));
+    carouselEl.appendChild(item);
+  });
+}
+
+function selectLens(i) {
+  currentLensIndex = i;
+  Array.from(carouselEl.children).forEach((el, idx) => {
+    const active = idx === i;
+    el.classList.toggle("active", active);
+    el.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  carouselEl.children[i].scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+}
+
+buildLensCarousel();
+
+async function setup() {
+  statusEl.textContent = "Loading face tracking model…";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const base = {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    },
+    outputFaceBlendshapes: false,
+    runningMode: "VIDEO",
+    numFaces: 1
+  };
+  try {
+    // GPU delegate is faster but unsupported in some mobile Safari versions
+    faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+      ...base, baseOptions: { ...base.baseOptions, delegate: "GPU" }
+    });
+  } catch (e) {
+    statusEl.textContent = "GPU mode unavailable, falling back to CPU…";
+    faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+      ...base, baseOptions: { ...base.baseOptions, delegate: "CPU" }
+    });
+  }
+}
+
+async function startCamera() {
+  startBtn.disabled = true;
+  try {
+    await setup();
+    statusEl.textContent = "Requesting camera…";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    statusEl.textContent = "Live — move your head slowly for best tracking.";
+    running = true;
+    requestAnimationFrame(loop);
+  } catch (err) {
+    statusEl.textContent = "Could not start: " + err.message;
+    startBtn.disabled = false;
+  }
+}
+
+function irisCenterAndRadius(landmarks, iris, w, h) {
+  // Compute the center as the average of the 4 documented boundary points
+  // rather than trusting a single "center" index — more robust across
+  // MediaPipe model/version differences.
+  let sx = 0, sy = 0;
+  for (const idx of iris.ring) {
+    sx += landmarks[idx].x * w;
+    sy += landmarks[idx].y * h;
+  }
+  const cx = sx / iris.ring.length, cy = sy / iris.ring.length;
+  let sum = 0;
+  for (const idx of iris.ring) {
+    const p = landmarks[idx];
+    sum += Math.hypot(p.x * w - cx, p.y * h - cy);
+  }
+  return { cx, cy, r: sum / iris.ring.length };
+}
+
+// --- Ambient-light sensing ---------------------------------------------
+// The lens PNG is a flat, evenly-lit asset, so drawn as-is it looks like it's
+// glowing from within regardless of the room. To make it read as a physical
+// object sitting on the eye, we sample the live camera frame every tick and
+// use that to scale how bright/dark the lens is drawn.
+//
+// A plain frame-average is a weak signal here: phone selfie cameras
+// auto-expose ON THE FACE, so the face itself comes out at roughly the same
+// brightness whether the room is bright or dim — only the background and
+// shadow areas actually darken. So instead of one global average, we weight
+// toward the DARKEST part of the frame (an approximate percentile), which
+// still separates a genuinely dark room from a bright one even when the
+// face is auto-exposed to look similar in both.
+const liteCanvas = document.createElement("canvas");
+liteCanvas.width = 32;
+liteCanvas.height = 24;
+const liteCtx = liteCanvas.getContext("2d", { willReadFrequently: true });
+
+let ambientLevel = 0.5;      // smoothed 0..1 scene brightness, updated per frame
+const AMBIENT_SMOOTHING = 0.15; // exponential moving average factor (lower = smoother/slower)
+
+function sampleAmbientBrightness() {
+  liteCtx.drawImage(video, 0, 0, liteCanvas.width, liteCanvas.height);
+  const { data } = liteCtx.getImageData(0, 0, liteCanvas.width, liteCanvas.height);
+  const lum = new Array(data.length / 4);
+  let sum = 0;
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    // Perceptual luminance (Rec. 601)
+    const l = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    lum[j] = l;
+    sum += l;
+  }
+  lum.sort((a, b) => a - b);
+  const meanLum = sum / lum.length;
+  const p25Lum = lum[Math.floor(lum.length * 0.25)]; // darkest-quartile brightness (shadows/background)
+
+  // Blend: mostly the shadow signal (more sensitive to real ambient light),
+  // some overall average (keeps it stable if the frame has no real shadow).
+  const combined = 0.7 * p25Lum + 0.3 * meanLum;
+  const raw = combined / 255; // 0 (black) .. 1 (white)
+
+  ambientLevel += (raw - ambientLevel) * AMBIENT_SMOOTHING;
+  return ambientLevel;
+}
+
+function drawLensOnEye(landmarks, eyeContourIdx, iris, w, h, ambient) {
+  const active = lensState[currentLensIndex];
+  if (!active || !active.loaded) return; // selected color still preloading
+
+  const { cx, cy, r: radius } = irisCenterAndRadius(landmarks, iris, w, h);
+  // Inflate the drawn image size so the artwork's OWN opaque circle — not
+  // the full image canvas — lands on the target diameter (iris diameter x
+  // overlap factor).
+  const targetOuterDiameter = radius * 2 * LENS_TO_IRIS_OVERLAP;
+  const r = targetOuterDiameter / active.artworkFraction;
+
+  ctx.save();
+  ctx.beginPath();
+  eyeContourIdx.forEach((idx, i) => {
+    const p = landmarks[idx];
+    const x = p.x * w, y = p.y * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.closePath();
+  ctx.clip(); // restrict drawing to the user's real open-eye shape
+
+  // Map ambient scene brightness (0..1) to a lens brightness multiplier and
+  // opacity. In a dark room the lens should sit closer to ~0.5x brightness
+  // and read more translucent; in bright light it should approach its full
+  // native brightness (and a touch beyond, like a real glossy lens catching
+  // light) instead of a flat, scene-independent shine.
+  const brightnessFactor = 0.3 + ambient * 1.35; // ~0.3 (dark) .. ~1.65 (bright)
+  const alpha = 0.48 + ambient * 0.44;           // ~0.48 (dark) .. ~0.92 (bright)
+
+  ctx.filter = `brightness(${brightnessFactor.toFixed(3)})`;
+  ctx.globalAlpha = Math.min(0.92, alpha);
+  ctx.drawImage(active.img, cx - r / 2, cy - r / 2, r, r);
+  ctx.filter = "none";
+  ctx.restore();
+}
+
+function loop() {
+  if (!running) return;
+  const now = performance.now();
+  const result = faceLandmarker.detectForVideo(video, now);
+
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.translate(-canvas.width, 0);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+    const ambient = sampleAmbientBrightness();
+    const lm = result.faceLandmarks[0];
+    drawLensOnEye(lm, RIGHT_EYE, RIGHT_IRIS, canvas.width, canvas.height, ambient);
+    drawLensOnEye(lm, LEFT_EYE, LEFT_IRIS, canvas.width, canvas.height, ambient);
+  }
+  ctx.restore();
+
+  requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener("click", startCamera);
+</script>
+</body>
+</html>
