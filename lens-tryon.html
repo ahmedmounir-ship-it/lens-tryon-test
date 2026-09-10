@@ -316,6 +316,78 @@ function sampleAmbientBrightness() {
   return ambientLevel;
 }
 
+// --- Realistic lens compositing ------------------------------------------
+// A flat source-over paint of the lens PNG is what makes it read as a
+// plastic sticker: it ignores the eye's own light/shadow structure and
+// paints straight over specular highlights. Instead we composite the lens
+// through an offscreen buffer so we can: (1) feather its outer edge with a
+// radial alpha mask instead of a hard cutout, (2) blend it into the iris
+// with 'overlay' so the eye's own shading shows through, topped with a
+// light 'source-over' pass to keep the color from washing out, (3) pull the
+// camera's own catchlights back on top with 'screen' so they aren't buried
+// under the lens layer, and (4) add a thin synthetic limbal ring so lenses
+// whose source art has no dark outer edge still read as sitting on a real
+// eye.
+const lensBuffer = document.createElement("canvas");
+const lensBufferCtx = lensBuffer.getContext("2d", { willReadFrequently: true });
+
+const featherMaskCache = new Map(); // size(px, rounded) -> offscreen radial-gradient mask canvas
+function getFeatherMask(size) {
+  const key = Math.round(size / 4) * 4; // round to reduce cache churn from sub-pixel jitter
+  let mask = featherMaskCache.get(key);
+  if (mask) return mask;
+  mask = document.createElement("canvas");
+  mask.width = key;
+  mask.height = key;
+  const mctx = mask.getContext("2d");
+  const r = key / 2;
+  const grad = mctx.createRadialGradient(r, r, r * 0.86, r, r, r);
+  grad.addColorStop(0, "rgba(255,255,255,1)");
+  grad.addColorStop(1, "rgba(255,255,255,0)"); // outer ~14% feathers to fully transparent
+  mctx.fillStyle = grad;
+  mctx.fillRect(0, 0, key, key);
+  featherMaskCache.set(key, mask);
+  return mask;
+}
+
+const catchlightCanvas = document.createElement("canvas");
+const catchlightCtx = catchlightCanvas.getContext("2d", { willReadFrequently: true });
+const CATCHLIGHT_LUMA_THRESHOLD = 200;
+
+// Pull bright camera pixels (real specular highlights on the cornea) out of
+// the region the lens is about to cover. localCx/localCy/localRadius are in
+// the SAME (mirrored) coordinate space drawLensOnEye already works in;
+// getImageData ignores the canvas's current transform and always reads real
+// device pixels, so we convert to device space first (the loop applies
+// scale(-1,1) + translate(-canvas.width,0), so deviceX = canvas.width - localX).
+function extractCatchlights(localCx, localCy, localRadius) {
+  const deviceCx = canvas.width - localCx;
+  const deviceCy = localCy;
+  const size = Math.max(2, Math.ceil(localRadius * 2));
+  const x0 = Math.round(deviceCx - localRadius);
+  const y0 = Math.round(deviceCy - localRadius);
+  const sx = Math.max(0, x0), sy = Math.max(0, y0);
+  const ex = Math.min(canvas.width, x0 + size), ey = Math.min(canvas.height, y0 + size);
+  const w = ex - sx, h = ey - sy;
+  if (w <= 0 || h <= 0) return null;
+
+  let imgData;
+  try {
+    imgData = ctx.getImageData(sx, sy, w, h);
+  } catch (e) {
+    return null; // e.g. tainted canvas in some embed contexts — skip catchlights, not fatal
+  }
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const luma = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    data[i + 3] = luma > CATCHLIGHT_LUMA_THRESHOLD ? 255 : 0;
+  }
+  catchlightCanvas.width = w;
+  catchlightCanvas.height = h;
+  catchlightCtx.putImageData(imgData, 0, 0);
+  return { x: sx, y: sy, w, h };
+}
+
 function drawLensOnEye(landmarks, eyeContourIdx, iris, w, h, ambient) {
   const active = lensState[currentLensIndex];
   if (!active || !active.loaded) return; // selected color still preloading
@@ -325,7 +397,32 @@ function drawLensOnEye(landmarks, eyeContourIdx, iris, w, h, ambient) {
   // the full image canvas — lands on the target diameter (iris diameter x
   // overlap factor).
   const targetOuterDiameter = radius * 2 * LENS_TO_IRIS_OVERLAP;
-  const r = targetOuterDiameter / active.artworkFraction;
+  const r = Math.max(2, Math.round(targetOuterDiameter / active.artworkFraction));
+
+  // Map ambient scene brightness (0..1) to a lens brightness multiplier and
+  // an overall strength. In a dark room the lens should sit dimmer and read
+  // more translucent; in bright light it should approach full strength.
+  const brightnessFactor = 0.3 + ambient * 1.35; // ~0.3 (dark) .. ~1.65 (bright)
+  const strength = 0.48 + ambient * 0.44;        // ~0.48 (dark) .. ~0.92 (bright)
+
+  // --- 1) Build the lens layer in an offscreen buffer, feathered -----------
+  // Drawing straight onto the eye with a hard-clipped polygon is what makes
+  // a lens read as a flat sticker: real lenses fade into the sclera instead
+  // of stopping on a crisp edge. So the color art + brightness filter go
+  // into a buffer first, then a radial gradient mask feathers the outer ~14%
+  // to transparent before it ever touches the main canvas.
+  lensBuffer.width = r;
+  lensBuffer.height = r;
+  lensBufferCtx.clearRect(0, 0, r, r);
+  lensBufferCtx.filter = `brightness(${brightnessFactor.toFixed(3)})`;
+  lensBufferCtx.drawImage(active.img, 0, 0, r, r);
+  lensBufferCtx.filter = "none";
+  lensBufferCtx.globalCompositeOperation = "destination-in";
+  lensBufferCtx.drawImage(getFeatherMask(r), 0, 0, r, r);
+  lensBufferCtx.globalCompositeOperation = "source-over";
+
+  // --- 2) Grab the eye's own catchlights before we cover them --------------
+  const catchlight = extractCatchlights(cx, cy, r / 2);
 
   ctx.save();
   ctx.beginPath();
@@ -337,18 +434,49 @@ function drawLensOnEye(landmarks, eyeContourIdx, iris, w, h, ambient) {
   ctx.closePath();
   ctx.clip(); // restrict drawing to the user's real open-eye shape
 
-  // Map ambient scene brightness (0..1) to a lens brightness multiplier and
-  // opacity. In a dark room the lens should sit closer to ~0.5x brightness
-  // and read more translucent; in bright light it should approach its full
-  // native brightness (and a touch beyond, like a real glossy lens catching
-  // light) instead of a flat, scene-independent shine.
-  const brightnessFactor = 0.3 + ambient * 1.35; // ~0.3 (dark) .. ~1.65 (bright)
-  const alpha = 0.48 + ambient * 0.44;           // ~0.48 (dark) .. ~0.92 (bright)
+  // --- 3) Composite: structure pass (overlay) + color pass (source-over) --
+  // 'overlay' blends the color through the iris's own light/dark texture and
+  // whatever's left of its shading, instead of painting flat over it. A
+  // second, lighter 'source-over' pass on top keeps the pigment from washing
+  // out — overlay alone reads as desaturated for vivid colors.
+  const drawX = cx - r / 2, drawY = cy - r / 2;
 
-  ctx.filter = `brightness(${brightnessFactor.toFixed(3)})`;
-  ctx.globalAlpha = Math.min(0.92, alpha);
-  ctx.drawImage(active.img, cx - r / 2, cy - r / 2, r, r);
-  ctx.filter = "none";
+  ctx.globalCompositeOperation = "overlay";
+  ctx.globalAlpha = Math.min(0.95, strength + 0.18);
+  ctx.drawImage(lensBuffer, drawX, drawY);
+
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = Math.min(0.6, strength * 0.55);
+  ctx.drawImage(lensBuffer, drawX, drawY);
+
+  // --- 4) Synthetic limbal ring ---------------------------------------------
+  // A thin dark ring at the very outer edge of the iris reads as depth even
+  // when the source art's own edge is soft or light-colored.
+  ctx.globalCompositeOperation = "multiply";
+  ctx.globalAlpha = 0.35;
+  const limbalGrad = ctx.createRadialGradient(cx, cy, r * 0.42, cx, cy, r * 0.5);
+  limbalGrad.addColorStop(0, "rgba(20,15,10,0)");
+  limbalGrad.addColorStop(0.82, "rgba(20,15,10,0)");
+  limbalGrad.addColorStop(1, "rgba(20,15,10,0.9)");
+  ctx.fillStyle = limbalGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r / 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- 5) Restore the camera's own specular highlights on top --------------
+  // 'screen' only ever brightens, so this punches the real catchlights back
+  // through the lens layer instead of leaving them buried under it.
+  if (catchlight) {
+    ctx.globalCompositeOperation = "screen";
+    ctx.globalAlpha = 0.9;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0); // catchlight pixels were captured in device space
+    ctx.drawImage(catchlightCanvas, catchlight.x, catchlight.y);
+    ctx.restore();
+  }
+
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 1;
   ctx.restore();
 }
 
